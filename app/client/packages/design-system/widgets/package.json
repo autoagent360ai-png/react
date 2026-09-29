@@ -27,7 +27,7 @@
     "@react-stately/collections": "^3.10.9",
     "@react-stately/list": "^3.10.8",
     "@react-types/actiongroup": "^3.4.6",
-    "@react-types/shared": "^3.23.1",
+    "@react-types/shared": "^3.36.1",
     "@tabler/icons-react": "^3.10.0",
     "clsx": "^2.0.0",
     "lodash": ">=4.17.21",
