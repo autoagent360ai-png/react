@@ -1,0 +1,180 @@
+package com.external.plugins.commands;
+
+import com.appsmith.external.exceptions.pluginExceptions.AppsmithPluginError;
+import com.appsmith.external.exceptions.pluginExceptions.AppsmithPluginException;
+import com.appsmith.external.models.ActionConfiguration;
+import com.external.plugins.models.ChatMessage;
+import com.external.plugins.models.ChatRequestDTO;
+import com.external.plugins.models.OpenAIRequestDTO;
+import com.external.plugins.utils.MessageUtils;
+import com.external.plugins.utils.RequestUtils;
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import lombok.extern.slf4j.Slf4j;
+import org.json.JSONObject;
+import org.springframework.http.HttpMethod;
+import org.springframework.util.CollectionUtils;
+import org.springframework.util.StringUtils;
+
+import java.lang.reflect.Type;
+import java.net.URI;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Pattern;
+
+import static com.external.plugins.constants.OpenAIConstants.CHAT;
+import static com.external.plugins.constants.OpenAIConstants.CHAT_MODEL_SELECTOR;
+import static com.external.plugins.constants.OpenAIConstants.ID;
+import static com.external.plugins.constants.OpenAIConstants.LABEL;
+import static com.external.plugins.constants.OpenAIConstants.MESSAGES;
+import static com.external.plugins.constants.OpenAIConstants.MODEL;
+import static com.external.plugins.constants.OpenAIConstants.TEMPERATURE;
+import static com.external.plugins.constants.OpenAIConstants.VALUE;
+import static com.external.plugins.constants.OpenAIErrorMessages.BAD_TEMPERATURE_CONFIGURATION;
+import static com.external.plugins.constants.OpenAIErrorMessages.EXECUTION_FAILURE;
+import static com.external.plugins.constants.OpenAIErrorMessages.INCORRECT_MESSAGE_FORMAT;
+import static com.external.plugins.constants.OpenAIErrorMessages.INCORRECT_ROLE_VALUE;
+import static com.external.plugins.constants.OpenAIErrorMessages.MODEL_NOT_SELECTED;
+import static com.external.plugins.constants.OpenAIErrorMessages.QUERY_NOT_CONFIGURED;
+import static com.external.plugins.constants.OpenAIErrorMessages.STRING_APPENDER;
+
+@Slf4j
+public class ChatCommand implements OpenAICommand {
+
+    private final Gson gson;
+
+    // Chat-completions families: gpt-*, chat* aliases (chatgpt-4o-latest, chat-latest) and o-series
+    // reasoning models (o1, o3, o4-mini, ...). Excluded: vision-suffixed models (listed by the vision
+    // command), variants served by other endpoints (image, realtime, tts, transcribe, legacy instruct
+    // completions) and models only available on the Responses API (-pro, deep-research, codex).
+    // Matched against the base model (fine-tune wrapper stripped) so customer-chosen ft: suffixes
+    // cannot trip the exclusions.
+    private final String regex =
+            "^(?!.*(vision|instruct|realtime|transcribe|tts|image|deep-research|codex|-pro))(gpt|chat|o\\d).*";
+    private final Pattern pattern = Pattern.compile(regex);
+
+    public ChatCommand(Gson gson) {
+        this.gson = gson;
+    }
+
+    @Override
+    public HttpMethod getTriggerHTTPMethod() {
+        return HttpMethod.GET;
+    }
+
+    @Override
+    public HttpMethod getExecutionMethod() {
+        return HttpMethod.POST;
+    }
+
+    @Override
+    public URI createTriggerUri() {
+        return RequestUtils.createUriFromCommand(MODEL);
+    }
+
+    @Override
+    public URI createExecutionUri() {
+        return RequestUtils.createUriFromCommand(CHAT);
+    }
+
+    @Override
+    public OpenAIRequestDTO makeRequestBody(ActionConfiguration actionConfiguration) {
+        Map<String, Object> formData = actionConfiguration.getFormData();
+        if (CollectionUtils.isEmpty(formData)) {
+            throw new AppsmithPluginException(
+                    AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                    String.format(STRING_APPENDER, EXECUTION_FAILURE, QUERY_NOT_CONFIGURED));
+        }
+
+        ChatRequestDTO chatRequestDTO = new ChatRequestDTO();
+        String model = RequestUtils.extractDataFromFormData(formData, CHAT_MODEL_SELECTOR);
+
+        if (!StringUtils.hasText(model)) {
+            throw new AppsmithPluginException(
+                    AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                    String.format(STRING_APPENDER, EXECUTION_FAILURE, MODEL_NOT_SELECTED));
+        }
+
+        chatRequestDTO.setModel(model);
+        // this will change to objects
+        List<ChatMessage> chatMessages =
+                transformToMessages(MessageUtils.extractMessages((Map<String, Object>) formData.get(MESSAGES)));
+        verifyRoleForChatMessages(chatMessages);
+
+        chatRequestDTO.setMessages(chatMessages);
+        // reasoning models reject any explicit temperature, including the form's default "0"
+        if (!RequestUtils.isReasoningModel(model)) {
+            chatRequestDTO.setTemperature(getTemperatureFromFormData(formData));
+        }
+        return chatRequestDTO;
+    }
+
+    private List<ChatMessage> transformToMessages(Object messages) {
+        if (messages == null) {
+            throw new AppsmithPluginException(
+                    AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                    String.format(STRING_APPENDER, EXECUTION_FAILURE, INCORRECT_MESSAGE_FORMAT));
+        }
+
+        Type chatListType = new TypeToken<List<ChatMessage>>() {}.getType();
+        try {
+            return gson.fromJson(gson.toJson(messages), chatListType);
+        } catch (Exception exception) {
+            log.debug("An exception occurred while converting types for messages: {}", messages);
+            throw new AppsmithPluginException(
+                    AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                    String.format(STRING_APPENDER, EXECUTION_FAILURE, INCORRECT_MESSAGE_FORMAT));
+        }
+    }
+
+    private void verifyRoleForChatMessages(List<ChatMessage> chatMessages) {
+        for (ChatMessage chatMessage : chatMessages) {
+            if (chatMessage.getRole() == null) {
+                throw new AppsmithPluginException(
+                        AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                        String.format(STRING_APPENDER, EXECUTION_FAILURE, INCORRECT_ROLE_VALUE));
+            }
+        }
+    }
+
+    private Float getTemperatureFromFormData(Map<String, Object> formData) {
+        String temperatureString = RequestUtils.extractValueFromFormData(formData, TEMPERATURE);
+
+        // Leave temperature unset unless the user provided one: reasoning models (o-series, gpt-5.*)
+        // reject any non-default temperature, and OpenAI applies its own default when it is omitted.
+        if (!StringUtils.hasText(temperatureString)) {
+            return null;
+        }
+
+        try {
+            float temperature = Float.parseFloat(temperatureString);
+            // parseFloat accepts "NaN" and "Infinity", which serialize to invalid JSON — treat as unset
+            return Float.isFinite(temperature) ? temperature : null;
+        } catch (IllegalArgumentException illegalArgumentException) {
+            return null;
+        } catch (Exception exception) {
+            throw new AppsmithPluginException(
+                    AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR,
+                    String.format(STRING_APPENDER, EXECUTION_FAILURE, BAD_TEMPERATURE_CONFIGURATION));
+        }
+    }
+
+    @Override
+    public Boolean isModelCompatible(JSONObject modelJsonObject) {
+        if (!modelJsonObject.has(ID)) {
+            return false;
+        }
+
+        return pattern.matcher(RequestUtils.baseModel(modelJsonObject.getString(ID)))
+                .matches();
+    }
+
+    @Override
+    public Map<String, String> getModelMap(JSONObject modelJsonObject) {
+        Map<String, String> modelMap = new HashMap<>();
+        modelMap.put(LABEL, modelJsonObject.getString(ID));
+        modelMap.put(VALUE, modelJsonObject.getString(ID));
+        return modelMap;
+    }
+}

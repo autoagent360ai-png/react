@@ -1,0 +1,645 @@
+package com.appsmith.server.helpers;
+
+import com.appsmith.server.constants.Appsmith;
+import com.appsmith.server.constants.Security;
+import com.appsmith.server.domains.Application;
+import com.appsmith.server.domains.ApplicationPage;
+import com.appsmith.server.repositories.ApplicationRepository;
+import com.appsmith.server.solutions.ApplicationPermission;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.security.web.server.DefaultServerRedirectStrategy;
+import org.springframework.security.web.server.ServerRedirectStrategy;
+import org.springframework.security.web.server.WebFilterExchange;
+import org.springframework.stereotype.Component;
+import org.springframework.util.MultiValueMap;
+import org.springframework.util.StringUtils;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class RedirectHelper {
+
+    public static final String DEFAULT_REDIRECT_URL = "/applications";
+    public static final String ERROR = "error";
+    public static final String CHARACTER_QUESTION_MARK = "?";
+    public static final String CHARACTER_EQUALS = "=";
+    public static final String SIGNUP_SUCCESS_URL = "/signup-success";
+    public static final String APPLICATION_PAGE_URL = "/applications/%s/pages/%s/edit";
+    private static final String REDIRECT_URL_HEADER = "X-Redirect-Url";
+    public static final String REDIRECT_URL_QUERY_PARAM = "redirectUrl";
+    private static final String FORK_APP_ID_QUERY_PARAM = "appId";
+    public static final String FIRST_TIME_USER_EXPERIENCE_PARAM = "enableFirstTimeUserExperience";
+
+    private final ApplicationRepository applicationRepository;
+    private final ApplicationPermission applicationPermission;
+    private final ServerRedirectStrategy redirectStrategy = new DefaultServerRedirectStrategy();
+
+    /**
+     * This function determines the redirect url that the browser should redirect to post-login. The priority order
+     * in which these checks will be made are:
+     * 1. Query parameters
+     * 2. Headers
+     *
+     * @param request ServerHttpRequest object for the current request, used to inspect redirection details.
+     * @return Publishes the redirection url as a String.
+     */
+    public Mono<String> getRedirectUrl(ServerHttpRequest request) {
+        MultiValueMap<String, String> queryParams = request.getQueryParams();
+        HttpHeaders httpHeaders = request.getHeaders();
+
+        if (queryParams.getFirst(REDIRECT_URL_QUERY_PARAM) != null) {
+            return Mono.just(fulfillRedirectUrl(queryParams.getFirst(REDIRECT_URL_QUERY_PARAM), httpHeaders));
+
+        } else if (queryParams.getFirst(FORK_APP_ID_QUERY_PARAM) != null) {
+            final String forkAppId = queryParams.getFirst(FORK_APP_ID_QUERY_PARAM);
+            final String origin = getTrustedOrigin(httpHeaders);
+            if (origin == null) {
+                return Mono.just(DEFAULT_REDIRECT_URL);
+            }
+            final String defaultRedirectUrl = origin + DEFAULT_REDIRECT_URL;
+            return applicationRepository
+                    .findByClonedFromApplicationId(forkAppId, applicationPermission.getReadPermission())
+                    .map(application -> {
+                        String pageId = null;
+                        for (final ApplicationPage page : application.getPages()) {
+                            if (pageId == null || page.isDefault()) {
+                                pageId = page.getId();
+                            }
+                            if (page.isDefault()) {
+                                break;
+                            }
+                        }
+
+                        if (pageId == null) {
+                            return defaultRedirectUrl;
+                        }
+
+                        return origin + "/applications/" + application.getId() + "/pages/" + pageId + "/edit";
+                    })
+                    .defaultIfEmpty(defaultRedirectUrl)
+                    .last();
+        }
+
+        return Mono.just(getRedirectUrlFromHeader(httpHeaders));
+    }
+
+    private static String getRedirectUrlFromHeader(HttpHeaders httpHeaders) {
+        // First check if the custom redirect header is set
+        String redirectUrl = fulfillRedirectUrl(httpHeaders.getFirst(REDIRECT_URL_HEADER), httpHeaders);
+
+        // If the redirect Url is still empty, construct the redirect Url from the Referer header.
+        if (StringUtils.isEmpty(redirectUrl)) {
+            // If the header is still empty
+            String refererHeader = httpHeaders.getFirst(Security.REFERER_HEADER);
+            if (refererHeader != null && !refererHeader.isBlank()) {
+                URI uri;
+                try {
+                    uri = new URI(refererHeader);
+                    String authority = uri.getAuthority();
+                    String scheme = uri.getScheme();
+                    redirectUrl = scheme + "://" + authority;
+                } catch (URISyntaxException e) {
+                    redirectUrl = DEFAULT_REDIRECT_URL;
+                }
+            } else {
+                redirectUrl = DEFAULT_REDIRECT_URL;
+            }
+        }
+
+        return redirectUrl;
+    }
+
+    /**
+     * If redirectUrl is empty, it'll be set to DEFAULT_REDIRECT_URL.
+     * If the redirectUrl does not have the base url, it'll prepend that from header origin.
+     * If the redirectUrl is an absolute URL pointing to a different host, it is rejected
+     * to prevent open redirect attacks.
+     *
+     * @param redirectUrl
+     * @param httpHeaders
+     * @return
+     */
+    private static String fulfillRedirectUrl(String redirectUrl, HttpHeaders httpHeaders) {
+        if (!StringUtils.hasText(redirectUrl)) {
+            redirectUrl = DEFAULT_REDIRECT_URL;
+        }
+
+        String trustedOrigin = getTrustedOrigin(httpHeaders);
+        if (!(redirectUrl.startsWith("http://") || redirectUrl.startsWith("https://"))
+                && StringUtils.hasText(trustedOrigin)) {
+            redirectUrl = trustedOrigin + redirectUrl;
+        }
+
+        // Validate that absolute redirect URLs point to the same origin as the request.
+        // This prevents open redirect attacks where an attacker supplies an external URL
+        // (e.g., https://evil.com) as the redirectUrl parameter.
+        redirectUrl = sanitizeRedirectUrl(redirectUrl, httpHeaders);
+
+        return redirectUrl;
+    }
+
+    /**
+     * Checks whether a redirect URL is safe by verifying it is either:
+     * - A relative path (no scheme), or
+     * - An absolute URL whose host matches the request's Origin header, or
+     * - An absolute URL whose host matches the request's X-Forwarded-Host / Host
+     *   header (used as a fallback when Origin is absent — browsers do not send
+     *   Origin on top-level GET navigations such as SSO entry redirects).
+     *
+     * This prevents open redirect vulnerabilities where user-supplied URLs
+     * could redirect authenticated users to attacker-controlled domains.
+     *
+     * @param redirectUrl The URL to validate
+     * @param httpHeaders The HTTP headers from the current request
+     * @return true if the URL is safe to redirect to, false otherwise
+     */
+    static boolean isSafeRedirectUrl(String redirectUrl, HttpHeaders httpHeaders) {
+        if (!StringUtils.hasText(redirectUrl)) {
+            return true;
+        }
+
+        // Only single-slash-prefixed relative paths are safe (e.g., /applications)
+        if (redirectUrl.startsWith("/") && !redirectUrl.startsWith("//")) {
+            return true;
+        }
+
+        // Reject anything that isn't http(s) — covers javascript:, data:, //, bare paths, etc.
+        if (!redirectUrl.startsWith("http://") && !redirectUrl.startsWith("https://")) {
+            return false;
+        }
+
+        final URI redirectUri;
+        try {
+            redirectUri = new URI(redirectUrl);
+        } catch (URISyntaxException e) {
+            log.warn("Blocked redirect with malformed URL: {}", sanitizeForLog(redirectUrl));
+            return false;
+        }
+
+        // Reject URLs with userinfo (e.g., https://evil.com@app.appsmith.com)
+        // Java's URI parser treats evil.com as userinfo and app.appsmith.com as host,
+        // but browser behavior varies — block these outright to be safe.
+        if (redirectUri.getUserInfo() != null) {
+            return false;
+        }
+
+        String redirectHost = redirectUri.getHost();
+        if (redirectHost == null) {
+            return false;
+        }
+
+        String origin = getTrustedOrigin(httpHeaders);
+        if (StringUtils.hasText(origin)) {
+            // Origin-present path: full host + port + scheme-aware port normalization.
+            final URI originUri;
+            try {
+                originUri = new URI(origin);
+            } catch (URISyntaxException e) {
+                log.warn("Failed to parse Origin header: {}", sanitizeForLog(origin));
+                return false;
+            }
+            String originHost = originUri.getHost();
+            if (originHost == null) {
+                return false;
+            }
+
+            // Compare host and port.
+            // When both URIs omit the port (raw port == -1), treat them as matching
+            // regardless of scheme — a scheme downgrade (https → http) on the same host
+            // is a transport-security concern, not an open redirect.
+            // When at least one port is explicit, normalize default ports per scheme
+            // (80 for http, 443 for https) before comparing.
+            int rawRedirectPort = redirectUri.getPort();
+            int rawOriginPort = originUri.getPort();
+            boolean portsMatch;
+            if (rawRedirectPort == -1 && rawOriginPort == -1) {
+                portsMatch = true;
+            } else {
+                portsMatch = normalizePort(redirectUri.getScheme(), rawRedirectPort)
+                        == normalizePort(originUri.getScheme(), rawOriginPort);
+            }
+
+            return redirectHost.equalsIgnoreCase(originHost) && portsMatch;
+        }
+
+        // Origin-absent path: browsers omit Origin on top-level GET navigations
+        // (e.g. window.location.href = "/oauth2/authorization/..."). Fall back to
+        // X-Forwarded-Host / Host. If neither header is present, reject to preserve
+        // strict behavior.
+        String requestHost = extractRequestHost(httpHeaders);
+        if (requestHost == null) {
+            return false;
+        }
+        // URI.getHost() returns IPv6 literals wrapped in brackets (e.g. "[::1]");
+        // strip them so the fallback host (which has no brackets) compares cleanly.
+        String normalizedRedirectHost = redirectHost;
+        if (normalizedRedirectHost.startsWith("[") && normalizedRedirectHost.endsWith("]")) {
+            normalizedRedirectHost = normalizedRedirectHost.substring(1, normalizedRedirectHost.length() - 1);
+        }
+        if (!normalizedRedirectHost.equalsIgnoreCase(requestHost)) {
+            return false;
+        }
+
+        // Compare ports too — a same-host redirect to a different port points at a
+        // different service on that host and must be rejected. The request headers
+        // carry no scheme, so an implicit request port is normalized to the default
+        // for the redirect URL's scheme (the redirectUrl is the browser's own
+        // location in legit flows, so its scheme reflects how the user is connected).
+        int requestPort = extractRequestPort(httpHeaders);
+        int normalizedRedirectPort = normalizePort(redirectUri.getScheme(), redirectUri.getPort());
+        int normalizedRequestPort = normalizePort(redirectUri.getScheme(), requestPort);
+        return normalizedRedirectPort == normalizedRequestPort;
+    }
+
+    /**
+     * Derives the request's client-facing hostname from HTTP headers. Prefers
+     * {@code X-Forwarded-Host} (handles proxied deployments and may carry a
+     * comma-separated list — the first entry is the outermost client-facing
+     * host), then falls back to the {@code Host} header. Returns {@code null}
+     * when neither is set.
+     *
+     * <p>Shared between {@link #isSafeRedirectUrl(String, HttpHeaders)} (origin-absent
+     * open-redirect guard) and {@code CustomServerOAuth2AuthorizationRequestResolverCE}
+     * (OAuth2 state-encoded host derivation), so both code paths stay aligned on
+     * what counts as the inbound request's host.
+     */
+    public static String extractRequestHost(HttpHeaders headers) {
+        String xfh = headers.getFirst("X-Forwarded-Host");
+        if (xfh != null && !xfh.isBlank()) {
+            int comma = xfh.indexOf(',');
+            String first = (comma >= 0 ? xfh.substring(0, comma) : xfh).trim();
+            return stripPort(first);
+        }
+        InetSocketAddress hostAddr = headers.getHost();
+        if (hostAddr != null
+                && hostAddr.getHostString() != null
+                && !hostAddr.getHostString().isBlank()) {
+            return hostAddr.getHostString();
+        }
+        return null;
+    }
+
+    /**
+     * Returns the {@code Origin} header value only when it is trustworthy —
+     * i.e. its host <em>and</em> effective port match the request's
+     * {@code X-Forwarded-Host} / {@code Host} (and {@code X-Forwarded-Port}).
+     *
+     * <p>If Origin is absent, returns {@code null}. If no request host is
+     * available for cross-checking (neither {@code X-Forwarded-Host} nor
+     * {@code Host} is set), Origin is returned as-is to preserve existing
+     * behaviour for environments that do not set proxy headers.
+     *
+     * <p>This prevents open redirect attacks where an attacker forges the
+     * {@code Origin} header to an external domain or a different port on the
+     * same host (APP-15347).
+     */
+    static String getTrustedOrigin(HttpHeaders httpHeaders) {
+        String origin = httpHeaders.getOrigin();
+        if (!StringUtils.hasText(origin)) {
+            return null;
+        }
+
+        String requestHost = extractRequestHost(httpHeaders);
+        if (requestHost == null) {
+            return origin;
+        }
+
+        final URI originUri;
+        try {
+            originUri = new URI(origin);
+        } catch (URISyntaxException e) {
+            log.warn("Failed to parse Origin header: {}", sanitizeForLog(origin));
+            return null;
+        }
+
+        String originHost = originUri.getHost();
+        if (originHost == null) {
+            log.warn(
+                    "Origin header '{}' does not match request host '{}'; treating as untrusted",
+                    sanitizeForLog(origin),
+                    requestHost);
+            return null;
+        }
+
+        if (originHost.startsWith("[") && originHost.endsWith("]")) {
+            originHost = originHost.substring(1, originHost.length() - 1);
+        }
+        if (!originHost.equalsIgnoreCase(requestHost)) {
+            log.warn(
+                    "Origin header '{}' does not match request host '{}'; treating as untrusted",
+                    sanitizeForLog(origin),
+                    requestHost);
+            return null;
+        }
+
+        int originPort = originUri.getPort();
+        int requestPort = extractRequestPort(httpHeaders);
+        if (originPort != -1 || requestPort != -1) {
+            int normalizedOriginPort = normalizePort(originUri.getScheme(), originPort);
+            int normalizedRequestPort = normalizePort(originUri.getScheme(), requestPort);
+            if (normalizedOriginPort != normalizedRequestPort) {
+                log.warn(
+                        "Origin port {} does not match request port {}; treating as untrusted",
+                        normalizedOriginPort,
+                        normalizedRequestPort);
+                return null;
+            }
+        }
+
+        return origin;
+    }
+
+    private static String stripPort(String hostMaybeWithPort) {
+        if (hostMaybeWithPort.startsWith("[")) { // IPv6 literal
+            int close = hostMaybeWithPort.indexOf(']');
+            return close > 0 ? hostMaybeWithPort.substring(1, close) : hostMaybeWithPort;
+        }
+        int colon = hostMaybeWithPort.indexOf(':');
+        return colon >= 0 ? hostMaybeWithPort.substring(0, colon) : hostMaybeWithPort;
+    }
+
+    /**
+     * Derives the request's client-facing port from HTTP headers. Reads, in order:
+     * {@code X-Forwarded-Port} (where proxies canonically place the client-facing
+     * port — honored even when {@code X-Forwarded-Host} is absent, e.g. proxies that
+     * preserve {@code Host} but convey the port separately), then a port embedded in
+     * the first {@code X-Forwarded-Host} entry, then the {@code Host} header's port.
+     * Returns {@code -1} when no explicit port is present (the caller treats this as
+     * the scheme default).
+     */
+    private static int extractRequestPort(HttpHeaders headers) {
+        String xfp = headers.getFirst("X-Forwarded-Port");
+        if (xfp != null && !xfp.isBlank()) {
+            int comma = xfp.indexOf(',');
+            String first = (comma >= 0 ? xfp.substring(0, comma) : xfp).trim();
+            try {
+                return Integer.parseInt(first);
+            } catch (NumberFormatException ignored) {
+                // fall through to other sources
+            }
+        }
+        String xfh = headers.getFirst("X-Forwarded-Host");
+        if (xfh != null && !xfh.isBlank()) {
+            int comma = xfh.indexOf(',');
+            String first = (comma >= 0 ? xfh.substring(0, comma) : xfh).trim();
+            return portOf(first);
+        }
+        InetSocketAddress hostAddr = headers.getHost();
+        if (hostAddr != null) {
+            int port = hostAddr.getPort();
+            return port > 0 ? port : -1;
+        }
+        return -1;
+    }
+
+    /**
+     * Parses the port from a {@code host[:port]} value (handling IPv6 brackets),
+     * returning {@code -1} when no valid port is present.
+     */
+    private static int portOf(String hostMaybeWithPort) {
+        String afterHost;
+        if (hostMaybeWithPort.startsWith("[")) { // IPv6 literal
+            int close = hostMaybeWithPort.indexOf(']');
+            if (close < 0) {
+                return -1;
+            }
+            afterHost = hostMaybeWithPort.substring(close + 1);
+        } else {
+            int colon = hostMaybeWithPort.indexOf(':');
+            if (colon < 0) {
+                return -1;
+            }
+            afterHost = hostMaybeWithPort.substring(colon);
+        }
+        if (afterHost.startsWith(":") && afterHost.length() > 1) {
+            try {
+                return Integer.parseInt(afterHost.substring(1));
+            } catch (NumberFormatException ignored) {
+                return -1;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Normalizes a port number, mapping -1 (unspecified) to the default port for the scheme.
+     * This ensures that https://app.com and https://app.com:443 are treated as equivalent.
+     */
+    private static int normalizePort(String scheme, int port) {
+        if (port != -1) {
+            return port;
+        }
+        if ("https".equalsIgnoreCase(scheme)) {
+            return 443;
+        }
+        if ("http".equalsIgnoreCase(scheme)) {
+            return 80;
+        }
+        return port;
+    }
+
+    /**
+     * Sanitizes a redirect URL to prevent open redirect attacks.
+     * If the URL is not safe (points to an external host), returns the default redirect URL.
+     * This method is intended for use by authentication handlers that construct redirect URLs
+     * from sources other than fulfillRedirectUrl (e.g., OAuth2 state parameter).
+     *
+     * @param redirectUrl The URL to sanitize
+     * @param httpHeaders The HTTP headers from the current request
+     * @return The original URL if safe, or the default redirect URL if not
+     */
+    public static String sanitizeRedirectUrl(String redirectUrl, HttpHeaders httpHeaders) {
+        if (isSafeRedirectUrl(redirectUrl, httpHeaders)) {
+            return redirectUrl;
+        }
+        log.warn("Blocked open redirect attempt to: {}", sanitizeForLog(redirectUrl));
+        String trustedOrigin = getTrustedOrigin(httpHeaders);
+        return (StringUtils.hasText(trustedOrigin) ? trustedOrigin : "") + DEFAULT_REDIRECT_URL;
+    }
+
+    /**
+     * Strips CR/LF (log-injection safety) and truncates over-long values so user-supplied
+     * URL / header content can be safely logged.
+     */
+    private static String sanitizeForLog(String value) {
+        if (value == null) {
+            return "";
+        }
+        String stripped = value.replaceAll("[\\r\\n]", "");
+        return stripped.length() > 200 ? stripped.substring(0, 200) + "..." : stripped;
+    }
+
+    /**
+     * This function only checks the incoming request for all possible sources of a redirection domain
+     * and returns with the first valid domain that it finds
+     *
+     * @param httpHeaders The headers received for the current request, used to inspect redirection details.
+     * @return A String that represents the origin that the request came from
+     */
+    public String getRedirectDomain(HttpHeaders httpHeaders) {
+        // This is the failsafe for when nothing could be identified
+        String redirectOrigin = Appsmith.DEFAULT_ORIGIN_HEADER;
+
+        // The value derived here becomes the OAuth redirect_uri for the datasource OAuth flow.
+        // It MUST be validated against the request host: an attacker who forges the Origin or
+        // Referer header could otherwise make the provider redirect the authorization code to
+        // an attacker-controlled domain (open redirect / auth-code interception).
+        final String requestHost = extractRequestHost(httpHeaders);
+
+        if (!StringUtils.isEmpty(httpHeaders.getOrigin())) {
+            // For PUT/POST requests or CORS? Only trust the Origin when it matches the request
+            // host; getTrustedOrigin returns null for a forged/cross-host Origin.
+            String trustedOrigin = getTrustedOrigin(httpHeaders);
+            if (trustedOrigin != null) {
+                redirectOrigin = trustedOrigin;
+            } else if (!StringUtils.isEmpty(httpHeaders.getHost())) {
+                redirectOrigin = redirectOriginFromHost(httpHeaders);
+            }
+        } else if (!StringUtils.isEmpty(httpHeaders.getFirst(Security.REFERER_HEADER))) {
+            // For generic web application requests
+            URI uri;
+            try {
+                uri = new URI(httpHeaders.getFirst(Security.REFERER_HEADER));
+                String authority = uri.getAuthority();
+                String scheme = uri.getScheme();
+                // Only trust the Referer-derived origin when its host matches the request host.
+                if (authority != null && scheme != null && requestHost != null && uri.getHost() != null) {
+                    String refererHost = uri.getHost();
+                    if (refererHost.startsWith("[") && refererHost.endsWith("]")) {
+                        refererHost = refererHost.substring(1, refererHost.length() - 1);
+                    }
+                    if (refererHost.equalsIgnoreCase(requestHost)) {
+                        redirectOrigin = scheme + "://" + authority;
+                    } else if (!StringUtils.isEmpty(httpHeaders.getHost())) {
+                        redirectOrigin = redirectOriginFromHost(httpHeaders);
+                    }
+                }
+            } catch (URISyntaxException ignored) {
+            }
+        } else if (!StringUtils.isEmpty(httpHeaders.getHost())) {
+            // For HTTP v1 requests
+            redirectOrigin = redirectOriginFromHost(httpHeaders);
+        }
+
+        return redirectOrigin;
+    }
+
+    private static String redirectOriginFromHost(HttpHeaders httpHeaders) {
+        String port = httpHeaders.getHost().getPort() != 80
+                ? ":" + httpHeaders.getHost().getPort()
+                : "";
+        return httpHeaders.getHost().getHostName() + port;
+    }
+
+    public String buildApplicationUrl(Application application, HttpHeaders httpHeaders) {
+        String redirectUrl = RedirectHelper.DEFAULT_REDIRECT_URL;
+        if (application != null
+                && application.getPages() != null
+                && application.getPages().size() > 0) {
+            ApplicationPage applicationPage = application.getPages().get(0);
+            redirectUrl =
+                    String.format(RedirectHelper.APPLICATION_PAGE_URL, application.getId(), applicationPage.getId());
+        }
+        return fulfillRedirectUrl(redirectUrl, httpHeaders);
+    }
+
+    /**
+     * Checks if the provided url is default redirect url
+     *
+     * @param url which needs to be checked
+     * @return true if default url. false otherwise
+     */
+    public boolean isDefaultRedirectUrl(String url) {
+        if (StringUtils.isEmpty(url)) {
+            return true;
+        }
+        try {
+            return URI.create(url).getPath().endsWith(RedirectHelper.DEFAULT_REDIRECT_URL);
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    public Mono<String> getAuthSuccessRedirectUrl(
+            WebFilterExchange webFilterExchange, Application defaultApplication, boolean isFromSignup) {
+        ServerWebExchange exchange = webFilterExchange.getExchange();
+        return Mono.just(exchange.getRequest()).flatMap(this::getRedirectUrl).map(redirectUrl -> {
+            String url = redirectUrl;
+            if (isFromSignup) {
+                boolean addFirstTimeExperienceParam = false;
+
+                // only redirect to default application if the redirectUrl contains no other url
+                if (isDefaultRedirectUrl(url) && defaultApplication != null) {
+                    addFirstTimeExperienceParam = true;
+                    HttpHeaders headers = exchange.getRequest().getHeaders();
+                    url = this.buildApplicationUrl(defaultApplication, headers);
+                }
+                // This redirectUrl will be used by the client to redirect after showing a welcome page.
+                url = buildSignupSuccessUrl(url, addFirstTimeExperienceParam);
+            }
+            return url;
+        });
+    }
+
+    public Mono<Void> handleRedirect(
+            WebFilterExchange webFilterExchange, Application defaultApplication, boolean isFromSignup) {
+        ServerWebExchange exchange = webFilterExchange.getExchange();
+
+        // On authentication success, we send a redirect to the client's home page. This ensures that the session
+        // is set in the cookie on the browser.
+
+        return getAuthSuccessRedirectUrl(webFilterExchange, defaultApplication, isFromSignup)
+                .map(URI::create)
+                .flatMap(redirectUri -> redirectStrategy.sendRedirect(exchange, redirectUri));
+    }
+
+    public String buildSignupSuccessUrl(String redirectUrl, boolean enableFirstTimeUserExperience) {
+        String url = SIGNUP_SUCCESS_URL + "?redirectUrl=" + URLEncoder.encode(redirectUrl, StandardCharsets.UTF_8);
+        if (enableFirstTimeUserExperience) {
+            url += "&" + FIRST_TIME_USER_EXPERIENCE_PARAM + "=true";
+        }
+        return url;
+    }
+
+    /**
+     * To build failure URL
+     * @param redirectPrefix Redirect URL prefix
+     * @param failureMessage Failure message to be added to redirect URL
+     * @return Redirect URL
+     */
+    private String buildFailureUrl(String redirectPrefix, String failureMessage) {
+        String url = redirectPrefix
+                + CHARACTER_QUESTION_MARK
+                + ERROR
+                + CHARACTER_EQUALS
+                + URLEncoder.encode(failureMessage, StandardCharsets.UTF_8);
+
+        return url;
+    }
+
+    /**
+     * To redirect in error cases
+     * @param webFilterExchange WebFilterExchange
+     * @param redirectPrefix Redirect URL prefix
+     * @param failureMessage Failure message to be added to redirect URL
+     * @return Mono of void
+     */
+    public Mono<Void> handleErrorRedirect(
+            WebFilterExchange webFilterExchange, String redirectPrefix, String failureMessage) {
+        ServerWebExchange exchange = webFilterExchange.getExchange();
+        URI redirectURI = URI.create(buildFailureUrl(redirectPrefix, failureMessage));
+
+        return redirectStrategy.sendRedirect(exchange, redirectURI);
+    }
+}

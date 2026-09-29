@@ -1,0 +1,8 @@
+# This is a comment.
+# Each line is a file pattern followed by one or more owners.
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Blanket ownership: @appsmithorg/core-owners reviews all changes across the
+# codebase (this file is intentionally shared/identical between the CE
+# `appsmith` repo and the `appsmith-ee` repo).
+* @appsmithorg/core-owners

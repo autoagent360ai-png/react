@@ -1,0 +1,282 @@
+package com.external.plugins;
+
+import com.appsmith.external.models.ActionConfiguration;
+import com.external.plugins.commands.VisionCommand;
+import com.external.plugins.models.QueryType;
+import com.external.plugins.models.UserQuery;
+import com.external.plugins.models.VisionRequestDTO;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.gson.Gson;
+import org.json.JSONObject;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.net.URI;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static com.external.plugins.constants.OpenAIConstants.CONTENT;
+import static com.external.plugins.constants.OpenAIConstants.DATA;
+import static com.external.plugins.constants.OpenAIConstants.ID;
+import static com.external.plugins.constants.OpenAIConstants.MAX_TOKENS;
+import static com.external.plugins.constants.OpenAIConstants.SYSTEM_MESSAGES;
+import static com.external.plugins.constants.OpenAIConstants.TEMPERATURE;
+import static com.external.plugins.constants.OpenAIConstants.USER_MESSAGES;
+import static com.external.plugins.constants.OpenAIConstants.VISION_MODEL_SELECTOR;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+public class VisionCommandTest {
+    private static final Gson gson = new Gson();
+    private VisionCommand visionCommand;
+
+    @BeforeEach
+    public void setup() {
+        visionCommand = new VisionCommand(gson);
+    }
+
+    @Test
+    public void testCreateTriggerUri() {
+        URI uri = visionCommand.createTriggerUri();
+        assertEquals("/v1/models", uri.getPath());
+    }
+
+    @Test
+    public void testCreateExecutionUri() {
+        URI uri = visionCommand.createExecutionUri();
+
+        assertEquals("/v1/chat/completions", uri.getPath());
+    }
+
+    @Test
+    public void testMakeRequestBody_withValidData() {
+        Map<String, Object> formData = new HashMap<>();
+        formData.put(VISION_MODEL_SELECTOR, Map.of(DATA, "gpt-4-vision-preview"));
+        formData.put(TEMPERATURE, "0.1");
+        formData.put(MAX_TOKENS, "1000");
+
+        formData.put(
+                SYSTEM_MESSAGES,
+                Map.of("data", List.of(Map.of(CONTENT, "Assistant Helper 1"), Map.of(CONTENT, "Assistant Helper 2"))));
+
+        UserQuery userQuery1 = new UserQuery();
+        userQuery1.setContent("What's in this image?");
+        userQuery1.setType(QueryType.TEXT);
+
+        UserQuery userQuery2 = new UserQuery();
+        userQuery2.setType(QueryType.IMAGE);
+        userQuery2.setContent("https://docs.appsmith.com/img/imagetable.gif");
+
+        formData.put(USER_MESSAGES, Map.of("data", List.of(userQuery1, userQuery2)));
+        ActionConfiguration actionConfiguration = new ActionConfiguration();
+        actionConfiguration.setFormData(formData);
+
+        VisionRequestDTO request = (VisionRequestDTO) visionCommand.makeRequestBody(actionConfiguration);
+
+        assertEquals("gpt-4-vision-preview", request.getModel());
+        assertEquals(0.1f, request.getTemperature());
+        assertEquals(1000, request.getMaxCompletionTokens());
+        assertNotNull(request.getMessages());
+        assertEquals(3, request.getMessages().size());
+    }
+
+    @Test
+    public void testModelFilter() {
+        List<String> models = List.of(
+                "text-search-babbage-doc-001",
+                "gpt-3.5-turbo-16k-0613",
+                "curie-search-query",
+                "gpt-3.5-turbo-16k",
+                "text-search-babbage-query-001",
+                "babbage",
+                "babbage-search-query",
+                "text-babbage-001",
+                "whisper-1",
+                "text-similarity-davinci-001",
+                "davinci-similarity",
+                "code-davinci-edit-001",
+                "curie-similarity",
+                "babbage-search-document",
+                "curie-instruct-beta",
+                "text-search-ada-doc-001",
+                "davinci-instruct-beta",
+                "gpt-3.5-turbo-0613",
+                "text-similarity-babbage-001",
+                "text-search-davinci-doc-001",
+                "gpt-4-0314",
+                "gpt-4-0613",
+                "gpt-4",
+                "babbage-similarity",
+                "text-embedding-ada-002",
+                "davinci-search-query",
+                "text-similarity-curie-001",
+                "text-davinci-001",
+                "text-search-davinci-query-001",
+                "ada-search-document",
+                "ada-code-search-code",
+                "babbage-002",
+                "davinci-002",
+                "davinci-search-document",
+                "curie-search-document",
+                "babbage-code-search-code",
+                "text-search-ada-query-001",
+                "code-search-ada-text-001",
+                "babbage-code-search-text",
+                "code-search-babbage-code-001",
+                "ada-search-query",
+                "ada-code-search-text",
+                "text-search-curie-query-001",
+                "text-davinci-002",
+                "text-davinci-edit-001",
+                "code-search-babbage-text-001",
+                "gpt-3.5-turbo",
+                "gpt-3.5-turbo-instruct-0914",
+                "ada",
+                "text-ada-001",
+                "ada-similarity",
+                "code-search-ada-code-001",
+                "text-similarity-ada-001",
+                "gpt-3.5-turbo-0301",
+                "gpt-3.5-turbo-instruct",
+                "text-search-curie-doc-001",
+                "text-davinci-003",
+                "text-curie-001",
+                "curie",
+                "davinci",
+                "gpt-4-vision-preview",
+                "gpt-4o");
+        int counter = 0;
+        for (String model : models) {
+            JSONObject jsonObject = new JSONObject(String.format("{\"%s\": \"%s\" }", ID, model));
+            if (visionCommand.isModelCompatible(jsonObject)) {
+                counter += 1;
+            }
+        }
+        assertEquals(counter, 2);
+    }
+
+    @Test
+    public void testMakeRequestBody_withoutTemperature_leavesTemperatureUnset() {
+        // non-reasoning model, so the blank-value path itself is exercised
+        Map<String, Object> formData = new HashMap<>();
+        formData.put(VISION_MODEL_SELECTOR, Map.of(DATA, "gpt-4o"));
+
+        UserQuery userQuery = new UserQuery();
+        userQuery.setContent("What's in this image?");
+        userQuery.setType(QueryType.TEXT);
+        formData.put(USER_MESSAGES, Map.of("data", List.of(userQuery)));
+
+        ActionConfiguration actionConfiguration = new ActionConfiguration();
+        actionConfiguration.setFormData(formData);
+
+        VisionRequestDTO request = (VisionRequestDTO) visionCommand.makeRequestBody(actionConfiguration);
+
+        assertNull(request.getTemperature());
+    }
+
+    @Test
+    public void testMakeRequestBody_nonFiniteTemperature_leavesTemperatureUnset() {
+        for (String badValue : List.of("NaN", "Infinity", "-Infinity")) {
+            Map<String, Object> formData = new HashMap<>();
+            formData.put(VISION_MODEL_SELECTOR, Map.of(DATA, "gpt-4o"));
+            formData.put(TEMPERATURE, badValue);
+
+            UserQuery userQuery = new UserQuery();
+            userQuery.setContent("What's in this image?");
+            userQuery.setType(QueryType.TEXT);
+            formData.put(USER_MESSAGES, Map.of("data", List.of(userQuery)));
+
+            ActionConfiguration actionConfiguration = new ActionConfiguration();
+            actionConfiguration.setFormData(formData);
+
+            VisionRequestDTO request = (VisionRequestDTO) visionCommand.makeRequestBody(actionConfiguration);
+
+            assertNull(request.getTemperature(), badValue + " must not be sent as temperature");
+        }
+    }
+
+    @Test
+    public void testMakeRequestBody_reasoningModels_dropTemperatureEvenWhenFormSendsDefault() {
+        // the editor form's temperature field has initialValue "0", so every new query sends it
+        assertNull(makeRequestWithTemperature("o3", "0").getTemperature(), "o3 must not receive a temperature");
+        assertNull(
+                makeRequestWithTemperature("gpt-5.4", "0").getTemperature(), "gpt-5.4 must not receive a temperature");
+
+        // non-reasoning models keep the explicit value, including the form default 0
+        assertEquals(0.0f, makeRequestWithTemperature("gpt-4o", "0").getTemperature());
+    }
+
+    private VisionRequestDTO makeRequestWithTemperature(String model, String temperature) {
+        Map<String, Object> formData = new HashMap<>();
+        formData.put(VISION_MODEL_SELECTOR, Map.of(DATA, model));
+        formData.put(TEMPERATURE, temperature);
+
+        UserQuery userQuery = new UserQuery();
+        userQuery.setContent("What's in this image?");
+        userQuery.setType(QueryType.TEXT);
+        formData.put(USER_MESSAGES, Map.of("data", List.of(userQuery)));
+
+        ActionConfiguration actionConfiguration = new ActionConfiguration();
+        actionConfiguration.setFormData(formData);
+        return (VisionRequestDTO) visionCommand.makeRequestBody(actionConfiguration);
+    }
+
+    @Test
+    public void testSerialization_usesMaxCompletionTokensAndOmitsNulls() throws Exception {
+        VisionRequestDTO request = new VisionRequestDTO();
+        request.setModel("gpt-4o");
+        request.setMaxCompletionTokens(1000);
+
+        String body = new ObjectMapper().writeValueAsString(request);
+
+        assertTrue(body.contains("\"max_completion_tokens\":1000"), "output cap must be sent as max_completion_tokens");
+        assertFalse(body.contains("temperature"), "null temperature must be omitted from the request body");
+    }
+
+    @Test
+    public void testModelFilter_currentGenerationModels() {
+        List<String> compatibleModels = List.of(
+                "gpt-4-vision-preview",
+                "gpt-4-1106-vision-preview",
+                "gpt-4o",
+                "gpt-4o-mini",
+                "gpt-4.1",
+                "gpt-4.1-nano",
+                "gpt-5",
+                "gpt-5.4",
+                "o1",
+                "o3",
+                "o4-mini",
+                "chatgpt-4o-latest",
+                "chat-latest",
+                "ft:gpt-4o:acme::abc123",
+                // exclusions apply to the base model only, not customer-chosen ft: suffixes
+                "ft:gpt-4o:acme-instruct-team::abc123");
+        List<String> incompatibleModels = List.of(
+                "o1-mini",
+                "o3-mini",
+                "o1-preview",
+                "gpt-3.5-turbo",
+                "whisper-1",
+                "text-embedding-3-small",
+                "dall-e-3",
+                // chat-capable but no image input, or Responses-API-only
+                "gpt-4o-audio-preview",
+                "gpt-4o-search-preview",
+                "gpt-4o-realtime-preview",
+                "o3-pro",
+                "gpt-5-codex");
+        for (String model : compatibleModels) {
+            JSONObject jsonObject = new JSONObject(String.format("{\"%s\": \"%s\" }", ID, model));
+            assertTrue(visionCommand.isModelCompatible(jsonObject), model + " should be listed");
+        }
+        for (String model : incompatibleModels) {
+            JSONObject jsonObject = new JSONObject(String.format("{\"%s\": \"%s\" }", ID, model));
+            assertFalse(visionCommand.isModelCompatible(jsonObject), model + " should not be listed");
+        }
+    }
+}

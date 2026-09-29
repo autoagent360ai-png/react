@@ -1,0 +1,53 @@
+package com.appsmith.server.solutions.ce;
+
+import com.appsmith.server.domains.User;
+import com.appsmith.server.dtos.TestEmailConfigRequestDTO;
+import org.springframework.http.codec.multipart.Part;
+import org.springframework.util.MultiValueMap;
+import reactor.core.publisher.Mono;
+
+import java.util.List;
+import java.util.Map;
+
+public interface EnvManagerCE {
+
+    /**
+     * Placeholder returned in place of secret-classified env values by the admin read-back API.
+     * A submitted value carrying this placeholder means "leave the stored value unchanged".
+     */
+    String MASKED_SECRET = "********";
+
+    Mono<List<String>> transformEnvContent(String envContent, Map<String, String> changes);
+
+    Mono<Void> applyChanges(Map<String, String> changes, String originHeader);
+
+    Mono<Void> applyChangesFromMultipartFormData(MultiValueMap<String, Part> formData, String originHeader);
+
+    void setAnalyticsEventAction(
+            Map<String, Object> properties, String newVariable, String originalVariable, String authEnv);
+
+    Mono<Map.Entry<String, String>> handleFileUpload(String key, List<Part> parts);
+
+    Map<String, String> parseToMap(String content);
+
+    Mono<Map<String, String>> getAllWithoutAclCheck();
+
+    Mono<Map<String, String>> getAll();
+
+    Mono<Map<String, String>> getAllNonEmpty();
+
+    Mono<User> verifyCurrentUserIsSuper();
+
+    Mono<Void> restart();
+
+    Mono<Void> restartWithoutAclCheck();
+
+    Mono<Boolean> sendTestEmail(TestEmailConfigRequestDTO requestDTO);
+
+    /**
+     * Writes {@code APPSMITH_MCP_INTERNAL_SECRET} to the env file without ACL or organization-config fan-out.
+     * An empty value unsets the variable. Does not restart; the client Save and Restart flow applies the secret.
+     * Callers must also update {@code CommonConfig#mcpInternalSecret} for the running process.
+     */
+    Mono<Void> persistMcpInternalSecret(String secret);
+}

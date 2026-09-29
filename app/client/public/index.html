@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en" translate="no">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="google" content="notranslate" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, shrink-to-fit=no, maximum-scale=1"
+    />
+    <title>Appsmith</title>
+    <style>
+      #loader {
+        position: fixed;
+        left: 0;
+        top: 0;
+        height: 4px;
+        background: #d7d7d7;
+        transition: all ease-in 0.3s;
+      }
+    </style>
+      <script>
+        // '' (empty strings), 'false' are falsy
+        // could return either boolean or string based on value
+        const parseConfig = (config) => {
+          if (
+            (config.startsWith("{") && config.endsWith("}")) ||
+            config.indexOf("__") === 0 ||
+            config.indexOf("$") === 0 ||
+            config.indexOf("%") === 0
+          )
+            return "";
+
+          const result = config.trim();
+          if (result.toLowerCase() === "false" || result === "") {
+            return false;
+          } else if (result.toLowerCase() === "true") {
+            return true;
+          }
+
+          return result;
+        };
+        const CLOUD_HOSTING = parseConfig('{{env "APPSMITH_CLOUD_HOSTING"}}');
+        const AIRGAPPED = parseConfig('{{env "APPSMITH_AIRGAP_ENABLED"}}');
+        const REO_CLIENT_ID = parseConfig('{{env "APPSMITH_REO_CLIENT_ID"}}');
+        const DISABLE_BETTERBUGS = parseConfig('{{env "APPSMITH_DISABLE_BETTERBUGS"}}');
+      </script>
+    <script>
+        window.__APPSMITH_CHUNKS_TO_PRELOAD =
+      <%=
+        (function () {
+          // This code emits URLs to be preloaded as soon as the main bundle loads.
+          // If you code-split away some files and need to preload them as well, here’s how to do that:
+          //  1) Give your import a name (use the `webpackChunkName` comment: `import(/* webpackChunkName: "my-name" */ "./my-file")`)
+          //  2) Add the name into the `chunksToPreload` array below
+          let chunksToPreload = {
+            'edit-mode': [...getChunkUrls("AppIDE"), ...getChunkUrls("global-search")],
+            'view-mode': getChunkUrls("AppViewer")
+          };
+
+          return JSON.stringify(chunksToPreload);
+
+          function getChunkUrls(chunkName) {
+            return compilation.namedChunkGroups.get(chunkName).chunks.flatMap(chunk => [...chunk.files]);
+          }
+        })()
+          %>
+    </script>
+
+    <!-- Start of Reo Javascript -->
+    <script type="text/javascript">
+      if (CLOUD_HOSTING && REO_CLIENT_ID) {
+        !function(){var e,t,n;e=REO_CLIENT_ID,t=function(){Reo.init({clientID:REO_CLIENT_ID})},(n=document.createElement("script")).src="https://static.reo.dev/"+e+"/reo.js",n.async=!0,n.onload=t,document.head.appendChild(n)}();
+      }
+    </script>
+    <!-- End of Reo Javascript -->
+
+    <!-- Start of BetterBugs Recording Links — https://docs.betterbugs.io/dashboard/workspace-settings/recording-links -->
+    <script type="text/javascript">
+      if (!DISABLE_BETTERBUGS && !AIRGAPPED) {
+        window.__BetterbugsRecordingLinkConfig = {
+          styles: { theme: "light", primaryColor: "#E15615", primaryTextColor: "#ffffff" },
+          successMessageHeaderText: "Information received",
+          successMessageSubHeaderText: "Our support team will use it to review the issue",
+        };
+        const s1 = document.createElement("script");
+        s1.src = "https://pkg.betterbugs.io/scripts/latest/logs-capture.js";
+        s1.async = false;
+        document.head.appendChild(s1);
+        const s2 = document.createElement("script");
+        s2.src = "https://pkg.betterbugs.io/scripts/latest/recorder.js";
+        s2.async = false;
+        document.head.appendChild(s2);
+      }
+    </script>
+    <!-- End of BetterBugs Recording Links -->
+  </head>
+
+  <body class="appsmith-light-theme">
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="loader" style="width: 30vw"></div>
+    <!--
+    To keep zIndex for tooltips higher than app comments, todo remove when migrating to Tooltip2
+    Currently the className does not apply to the portal root, so we're unable to work with z-indexes based on that
+  -->
+    <div id="header-root"></div>
+    <div id="root"></div>
+    <div
+      id="date-picker-control"
+      style="position: relative; z-index: 1000"
+    ></div>
+    <script type="text/javascript">
+      // Ref: https://github.com/Modernizr/Modernizr/blob/94592f279a410436530c7c06acc42a6e90c20150/feature-detects/storage/localstorage.js
+      const getIsLocalStorageSupported = () => {
+        try {
+          window.localStorage.setItem("test", "testA");
+          window.localStorage.removeItem("test");
+          return true;
+        } catch (e) {
+          return false;
+        }
+      };
+      const isLocalStorageSupported = getIsLocalStorageSupported();
+
+      const handleLocalStorageNotSupportedError = () => {
+        console.error("Localstorage storage is not supported on your device.");
+      };
+
+      const localStorageUtil = {
+        getItem: (key) => {
+          if (!isLocalStorageSupported) {
+            handleLocalStorageNotSupportedError();
+            return;
+          }
+          return window.localStorage.getItem(key);
+        },
+        removeItem: (key) => {
+          if (!isLocalStorageSupported) {
+            handleLocalStorageNotSupportedError();
+            return;
+          }
+          return window.localStorage.removeItem(key);
+        },
+        setItem: (key, value) => {
+          if (!isLocalStorageSupported) {
+            handleLocalStorageNotSupportedError();
+            return;
+          }
+          return window.localStorage.setItem(key, value);
+        },
+      };
+      window.addEventListener("DOMContentLoaded", (event) => {
+        document.getElementById("loader").style.width = "50vw";
+      });
+
+      const registerPageServiceWorker = () => {
+        if (
+          "serviceWorker" in navigator &&
+          // Disable the service worker in Cypress tests. We primarily do this to make
+          // the Performance/LinkRelPreload_Spec.js test work (as it collects URLs all network requests,
+          // and service worker requests fail it.) But, anecdotally, disabling the service worker
+          // also seems to make the tests a bit faster, as the network load is lower.
+          !window.Cypress
+        ) {
+          window.addEventListener("load", function () {
+            navigator.serviceWorker
+              .register("/pageService.js")
+              .catch((error) => {
+                console.error("Service Worker Registration failed: " + error);
+              });
+          });
+        }
+      };
+      registerPageServiceWorker();
+    </script>
+    <script type="text/javascript">
+      const LOG_LEVELS = ["debug", "error"];
+      const CONFIG_LOG_LEVEL_INDEX = LOG_LEVELS.indexOf(
+        parseConfig('{{env "APPSMITH_CLIENT_LOG_LEVEL"}}'),
+      );
+
+      const PYLON_APP_ID_RAW =
+        parseConfig("%REACT_APP_PYLON_APP_ID%") ||
+        parseConfig("%REACT_APP_INTERCOM_APP_ID%") ||
+        parseConfig('{{env "APPSMITH_PYLON_APP_ID"}}') ||
+        parseConfig('{{env "APPSMITH_INTERCOM_APP_ID"}}');
+      const DISABLE_PYLON =
+        parseConfig('{{env "APPSMITH_DISABLE_PYLON"}}') ||
+        parseConfig('{{env "APPSMITH_DISABLE_INTERCOM"}}');
+      // No third-party chat widget on airgapped deployments (same as BetterBugs / legacy Intercom)
+      const PYLON_APP_ID =
+        AIRGAPPED || typeof PYLON_APP_ID_RAW !== "string"
+          ? ""
+          : PYLON_APP_ID_RAW;
+
+      // Pylon chat widget (https://docs.usepylon.com/pylon-docs/chat-widget/chat-setup)
+      // Install a stub Pylon() queue so early window.Pylon(...) calls don't error.
+      // The actual SDK script is loaded from bootPylon() in React, AFTER the user's
+      // email_hash has been set on window.pylon.chat_settings — Pylon exposes no API
+      // to update identity post-init, so the SDK must initialize with the full
+      // identity already present on window.pylon.
+      if (PYLON_APP_ID && !DISABLE_PYLON) {
+        window.pylon = {
+          chat_settings: {
+            app_id: PYLON_APP_ID,
+          },
+        };
+        (function () {
+          var n = function () {
+            n.e(arguments);
+          };
+          n.q = [];
+          n.e = function (e) {
+            n.q.push(e);
+          };
+          window.Pylon = n;
+        })();
+      }
+
+      window.SENTRY_CONFIG = parseConfig('{{env "APPSMITH_SENTRY_DSN"}}');
+      window.APPSMITH_FEATURE_CONFIGS = {
+        sentry: {
+          dsn: parseConfig('{{env "APPSMITH_SENTRY_DSN"}}'),
+          release: parseConfig('{{env "APPSMITH_SENTRY_RELEASE"}}'),
+          environment: parseConfig('{{env "APPSMITH_SENTRY_ENVIRONMENT"}}'),
+        },
+        smartLook: {
+          id: parseConfig('{{env "APPSMITH_SMART_LOOK_ID"}}'),
+        },
+        betterbugs: {
+          apiKey: DISABLE_BETTERBUGS ? '' : parseConfig('{{env "APPSMITH_BETTERBUGS_API_KEY"}}'),
+        },
+        segment: {
+          apiKey: parseConfig('{{env "APPSMITH_SEGMENT_KEY"}}'),
+          ceKey: parseConfig('{{env "APPSMITH_SEGMENT_CE_KEY"}}'),
+        },
+        observability: {
+          deploymentName: parseConfig('{{env "APPSMITH_DEPLOYMENT_NAME"}}'),
+          serviceInstanceId: parseConfig('{{env "APPSMITH_HOSTNAME"}}'),
+          tracingUrl: parseConfig('{{env "APPSMITH_FRONTEND_TRACING_URL"}}'),
+        },
+        fusioncharts: {
+          licenseKey: parseConfig('{{env "APPSMITH_FUSIONCHARTS_LICENSE_KEY"}}'),
+        },
+        mixpanel: {
+          enabled: parseConfig('{{env "APPSMITH_SEGMENT_KEY"}}'),
+          apiKey: parseConfig('{{env "APPSMITH_MIXPANEL_KEY"}}'),
+        },
+        logLevel:
+          CONFIG_LOG_LEVEL_INDEX > -1
+            ? LOG_LEVELS[CONFIG_LOG_LEVEL_INDEX]
+            : LOG_LEVELS[1],
+        cloudHosting: CLOUD_HOSTING,
+        appVersion: {
+          id: parseConfig('{{env "APPSMITH_VERSION_ID"}}') || "UNKNOWN",
+          sha: parseConfig('{{env "APPSMITH_VERSION_SHA"}}'),
+          releaseDate: parseConfig('{{env "APPSMITH_VERSION_RELEASE_DATE"}}'),
+        },
+        pylonAppID: PYLON_APP_ID,
+        mailEnabled: parseConfig('{{env "APPSMITH_MAIL_ENABLED"}}'),
+        googleRecaptchaSiteKey: parseConfig('{{env "APPSMITH_RECAPTCHA_SITE_KEY"}}'),
+        hideWatermark: parseConfig('{{env "APPSMITH_HIDE_WATERMARK"}}'),
+        disableIframeWidgetSandbox: parseConfig(
+          '{{env "APPSMITH_DISABLE_IFRAME_WIDGET_SANDBOX"}}',
+        ),
+        defaultHtmlLang:
+          parseConfig('{{env "APPSMITH_DEFAULT_HTML_LANG"}}') || "en",
+        customerPortalUrl:
+          parseConfig('{{env "APPSMITH_CUSTOMER_PORTAL_URL"}}') ||
+          "https://customer.appsmith.com",
+        pricingUrl:
+          parseConfig('{{env "APPSMITH_PRICING_URL"}}') ||
+          "https://www.appsmith.com/pricing",
+      };
+    </script>
+  </body>
+</html>

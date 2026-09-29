@@ -1,0 +1,74 @@
+import { ConfigFactory } from "pages/AdminSettings/config/ConfigFactory";
+
+import { config as ProfileConfig } from "pages/AdminSettings/config/profile";
+import { config as GeneralConfig } from "ee/pages/AdminSettings/config/general";
+import { config as EmailConfig } from "pages/AdminSettings/config/email";
+import { config as InstanceSettings } from "ee/pages/AdminSettings/config/instanceSettings";
+import { config as Configuration } from "ee/pages/AdminSettings/config/configuration";
+import { config as VersionConfig } from "pages/AdminSettings/config/version";
+import { config as UserSettings } from "ee/pages/AdminSettings/config/userSettings";
+import { config as Authentication } from "ee/pages/AdminSettings/config/authentication";
+import { config as BrandingConfig } from "ee/pages/AdminSettings/config/branding";
+import { config as ProvisioningConfig } from "ee/pages/AdminSettings/config/provisioning";
+import { config as UserListing } from "ee/pages/AdminSettings/config//userlisting";
+import { config as AuditLogsConfig } from "ee/pages/AdminSettings/config/auditlogs";
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- Ask AI is CE-owned; CE cannot add an ee/ shim (pre-push architecture guard).
+import { config as AIConfig } from "ce/pages/AdminSettings/config/ai";
+
+import { selectFeatureFlags } from "ee/selectors/featureFlagsSelectors";
+import store from "store";
+import { isMultiOrgFFEnabled } from "ee/utils/planHelpers";
+import { getCurrentUser } from "selectors/usersSelectors";
+import { getShowAdminSettings } from "ee/utils/BusinessFeatures/adminSettingsHelpers";
+import {
+  getMcpServerConfig,
+  mcpKeys,
+} from "ee/pages/AdminSettings/config/mcpServer";
+import { getIsMcpEnabled } from "ee/selectors/organizationSelectors";
+
+const featureFlags = selectFeatureFlags(store.getState());
+const isMultiOrgEnabled = isMultiOrgFFEnabled(featureFlags);
+const isMCPEnabled = getIsMcpEnabled(store.getState());
+const user = getCurrentUser(store.getState());
+const isFeatureEnabled = featureFlags.license_gac_enabled;
+const isSuperUser = getShowAdminSettings(isFeatureEnabled, user);
+
+// Profile categories
+ConfigFactory.register(ProfileConfig);
+
+if (isMCPEnabled) ConfigFactory.register(mcpKeys);
+
+// Organisation categories
+if (isSuperUser) ConfigFactory.register(GeneralConfig);
+
+if (isSuperUser && !isMultiOrgEnabled) ConfigFactory.register(EmailConfig);
+
+if (isSuperUser) ConfigFactory.register(BrandingConfig);
+
+if (isSuperUser) ConfigFactory.register(AuditLogsConfig);
+
+if (isSuperUser) ConfigFactory.register(AIConfig);
+
+if (isSuperUser && isMultiOrgEnabled)
+  ConfigFactory.register(getMcpServerConfig(isMultiOrgEnabled));
+
+// User management categories
+if (isSuperUser) ConfigFactory.register(UserSettings);
+
+if (isSuperUser) ConfigFactory.register(Authentication);
+
+if (isSuperUser) ConfigFactory.register(ProvisioningConfig);
+
+if (isSuperUser) ConfigFactory.register(UserListing);
+
+// Instance categories
+if (isSuperUser && !isMultiOrgEnabled) ConfigFactory.register(InstanceSettings);
+
+if (isSuperUser && !isMultiOrgEnabled) ConfigFactory.register(Configuration);
+
+if (isSuperUser && !isMultiOrgEnabled)
+  ConfigFactory.register(getMcpServerConfig(isMultiOrgEnabled));
+
+if (isSuperUser && !isMultiOrgEnabled) ConfigFactory.register(VersionConfig);
+
+export default ConfigFactory;

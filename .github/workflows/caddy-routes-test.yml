@@ -1,0 +1,37 @@
+name: Caddy route tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - release
+    paths:
+      - .github/workflows/caddy-routes-test.yml
+      - deploy/docker/fs/opt/appsmith/caddy-reconfigure.mjs
+      - deploy/docker/fs/opt/appsmith/templates/docker.env.sh
+      - deploy/docker/route-tests/**
+      - deploy/docker/tests/**
+  pull_request:
+    branches:
+      - release
+    paths:
+      - .github/workflows/caddy-routes-test.yml
+      - deploy/docker/fs/opt/appsmith/caddy-reconfigure.mjs
+      - deploy/docker/fs/opt/appsmith/templates/docker.env.sh
+      - deploy/docker/route-tests/**
+      - deploy/docker/tests/**
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: docker.env.sh default frame-ancestors is safe
+        run: deploy/docker/tests/docker-env-defaults-test.sh
+
+      - name: caddy rate-limit key is not spoofable (GHSA-qrgm-h8c4-jjf7)
+        run: deploy/docker/tests/caddy-rate-limit-key-test.sh
+
+      - run: deploy/docker/route-tests/run.sh

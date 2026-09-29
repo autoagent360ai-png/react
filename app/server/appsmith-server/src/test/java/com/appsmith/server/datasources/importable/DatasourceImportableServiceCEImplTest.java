@@ -1,0 +1,320 @@
+package com.appsmith.server.datasources.importable;
+
+import com.appsmith.external.models.AuthenticationDTO;
+import com.appsmith.external.models.BasicAuth;
+import com.appsmith.external.models.BearerTokenAuth;
+import com.appsmith.external.models.DBAuth;
+import com.appsmith.external.models.Datasource;
+import com.appsmith.external.models.DatasourceConfiguration;
+import com.appsmith.external.models.DatasourceStorage;
+import com.appsmith.external.models.DecryptedSensitiveFields;
+import com.appsmith.external.models.OAuth2;
+import com.appsmith.server.acl.AclPermission;
+import com.appsmith.server.datasources.base.DatasourceService;
+import com.appsmith.server.datasourcestorages.base.DatasourceStorageService;
+import com.appsmith.server.domains.Workspace;
+import com.appsmith.server.dtos.ArtifactExchangeJson;
+import com.appsmith.server.dtos.ImportingMetaDTO;
+import com.appsmith.server.dtos.MappedImportableResourcesDTO;
+import com.appsmith.server.services.WorkspaceService;
+import com.appsmith.server.solutions.DatasourcePermission;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.test.StepVerifier;
+
+import java.lang.reflect.Method;
+import java.util.HashMap;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+@ExtendWith(MockitoExtension.class)
+class DatasourceImportableServiceCEImplTest { // Renamed class to match convention
+
+    @Mock
+    DatasourceService datasourceService;
+
+    @Mock
+    WorkspaceService workspaceService;
+
+    @Mock
+    DatasourceStorageService datasourceStorageService;
+
+    @Mock
+    DatasourcePermission datasourcePermission;
+
+    DatasourceImportableServiceCEImpl importService;
+
+    @BeforeEach
+    void setUp() {
+        importService = new DatasourceImportableServiceCEImpl(
+                datasourceService, workspaceService, datasourceStorageService, datasourcePermission);
+    }
+
+    // Helper to call the private method using reflection
+    private void callUpdateAuthenticationDTOWithReflection(
+            DatasourceStorage datasourceStorage, DecryptedSensitiveFields decryptedFields) {
+        try {
+            Method method = DatasourceImportableServiceCEImpl.class.getDeclaredMethod(
+                    "updateAuthenticationDTO", DatasourceStorage.class, DecryptedSensitiveFields.class);
+            method.setAccessible(true);
+            method.invoke(importService, datasourceStorage, decryptedFields);
+        } catch (Exception e) {
+            fail("Failed to invoke updateAuthenticationDTO via reflection", e);
+        }
+    }
+
+    @Test
+    void updateAuthenticationDTO_WhenAuthTypeIsBearer_AndDecryptedTokenIsValid_ShouldSetBearerTokenAuth() {
+        DatasourceStorage storage = new DatasourceStorage();
+        DatasourceConfiguration dsConfig = new DatasourceConfiguration();
+        storage.setDatasourceConfiguration(dsConfig);
+
+        DecryptedSensitiveFields decryptedFields = new DecryptedSensitiveFields();
+        decryptedFields.setAuthType(BearerTokenAuth.class.getName());
+        BearerTokenAuth tokenDetails = new BearerTokenAuth();
+        tokenDetails.setBearerToken("test-bearer-token");
+        decryptedFields.setBearerTokenAuth(tokenDetails);
+
+        callUpdateAuthenticationDTOWithReflection(storage, decryptedFields);
+
+        AuthenticationDTO authResult = dsConfig.getAuthentication();
+        assertNotNull(authResult, "Authentication result should not be null");
+        assertTrue(authResult instanceof BearerTokenAuth, "Authentication should be BearerTokenAuth");
+        assertEquals("test-bearer-token", ((BearerTokenAuth) authResult).getBearerToken());
+    }
+
+    @Test
+    void
+            updateAuthenticationDTO_WhenAuthTypeIsBearer_AndDecryptedBearerTokenAuthIsNull_ShouldSetBearerAuthWithNullToken() {
+        DatasourceStorage storage = new DatasourceStorage();
+        DatasourceConfiguration dsConfig = new DatasourceConfiguration();
+        storage.setDatasourceConfiguration(dsConfig);
+
+        DecryptedSensitiveFields decryptedFields = new DecryptedSensitiveFields();
+        decryptedFields.setAuthType(BearerTokenAuth.class.getName());
+        decryptedFields.setBearerTokenAuth(null); // Key condition for the fix
+
+        callUpdateAuthenticationDTOWithReflection(storage, decryptedFields);
+
+        AuthenticationDTO authResult = dsConfig.getAuthentication();
+        assertNotNull(authResult, "Authentication result should not be null");
+        assertTrue(authResult instanceof BearerTokenAuth, "Authentication should be BearerTokenAuth");
+        assertNull(((BearerTokenAuth) authResult).getBearerToken(), "Bearer token should be null");
+    }
+
+    @Test
+    void updateAuthenticationDTO_WhenAuthTypeIsDbAuth_AndDbAuthDetailsArePresent_ShouldSetDbAuth() {
+        DatasourceStorage storage = new DatasourceStorage();
+        DatasourceConfiguration dsConfig = new DatasourceConfiguration();
+        storage.setDatasourceConfiguration(dsConfig);
+
+        DecryptedSensitiveFields decryptedFields = new DecryptedSensitiveFields();
+        decryptedFields.setAuthType(DBAuth.class.getName());
+        DBAuth dbAuthDetails = new DBAuth();
+        dbAuthDetails.setUsername("testuser");
+        decryptedFields.setPassword("testpassword"); // Password comes from top-level DecryptedSensitiveFields
+        decryptedFields.setDbAuth(dbAuthDetails);
+
+        callUpdateAuthenticationDTOWithReflection(storage, decryptedFields);
+
+        AuthenticationDTO authResult = dsConfig.getAuthentication();
+        assertNotNull(authResult, "Authentication result should not be null");
+        assertTrue(authResult instanceof DBAuth, "Authentication should be DBAuth");
+        assertEquals("testuser", ((DBAuth) authResult).getUsername());
+        assertEquals("testpassword", ((DBAuth) authResult).getPassword());
+    }
+
+    @Test
+    void updateAuthenticationDTO_WhenAuthTypeIsDbAuth_AndDecryptedDbAuthIsNull_ShouldSetDbAuthWithPasswordOnly() {
+        DatasourceStorage storage = new DatasourceStorage();
+        DatasourceConfiguration dsConfig = new DatasourceConfiguration();
+        storage.setDatasourceConfiguration(dsConfig);
+
+        DecryptedSensitiveFields decryptedFields = new DecryptedSensitiveFields();
+        decryptedFields.setAuthType(DBAuth.class.getName());
+        decryptedFields.setDbAuth(null); // Decrypted DBAuth object within DecryptedSensitiveFields is null
+        decryptedFields.setPassword("only-password");
+
+        callUpdateAuthenticationDTOWithReflection(storage, decryptedFields);
+
+        AuthenticationDTO authResult = dsConfig.getAuthentication();
+        assertNotNull(authResult, "Authentication result should not be null");
+        // The actual method creates a new DBAuth if decryptedFields.getDbAuth() is null.
+        // And then sets the password on it.
+        assertTrue(authResult instanceof DBAuth, "Authentication should be DBAuth");
+        assertNull(
+                ((DBAuth) authResult).getUsername(), "Username should be null as the provided DBAuth object was null");
+        assertEquals("only-password", ((DBAuth) authResult).getPassword(), "Password should be set");
+    }
+
+    @Test
+    void updateAuthenticationDTO_WhenAuthTypeIsBasicAuth_AndBasicAuthDetailsArePresent_ShouldSetBasicAuth() {
+        DatasourceStorage storage = new DatasourceStorage();
+        DatasourceConfiguration dsConfig = new DatasourceConfiguration();
+        storage.setDatasourceConfiguration(dsConfig);
+
+        DecryptedSensitiveFields decryptedFields = new DecryptedSensitiveFields();
+        decryptedFields.setAuthType(BasicAuth.class.getName());
+        BasicAuth basicAuthDetails = new BasicAuth();
+        basicAuthDetails.setUsername("basicuser");
+        decryptedFields.setPassword("basicpassword");
+        decryptedFields.setBasicAuth(basicAuthDetails);
+
+        callUpdateAuthenticationDTOWithReflection(storage, decryptedFields);
+
+        AuthenticationDTO authResult = dsConfig.getAuthentication();
+        assertNotNull(authResult);
+        assertTrue(authResult instanceof BasicAuth);
+        assertEquals("basicuser", ((BasicAuth) authResult).getUsername());
+        assertEquals("basicpassword", ((BasicAuth) authResult).getPassword());
+    }
+
+    @Test
+    void updateAuthenticationDTO_WhenAuthTypeIsOAuth2_AndOAuth2DetailsArePresent_ShouldSetOAuth2() {
+        // This is a simplified test for OAuth2 as it has more complex internal state (AuthenticationResponse)
+        // The main goal is to ensure the OAuth2 block is entered and an OAuth2 object is set.
+        DatasourceStorage storage = new DatasourceStorage();
+        DatasourceConfiguration dsConfig = new DatasourceConfiguration();
+        storage.setDatasourceConfiguration(dsConfig);
+
+        DecryptedSensitiveFields decryptedFields = new DecryptedSensitiveFields();
+        decryptedFields.setAuthType(OAuth2.class.getName());
+        OAuth2 oauth2Details = new OAuth2();
+        oauth2Details.setClientId("test-client-id");
+        // For OAuth2, password from decryptedFields is typically clientSecret
+        decryptedFields.setPassword("test-client-secret");
+        decryptedFields.setOpenAuth2(oauth2Details);
+        // Other OAuth2 fields like token, refreshToken, tokenResponse would be set on `authResponse`
+        // inside the actual method. For this test, we mainly check if OAuth2 is set.
+        decryptedFields.setToken("sample-token");
+        decryptedFields.setRefreshToken("sample-refresh-token");
+
+        callUpdateAuthenticationDTOWithReflection(storage, decryptedFields);
+
+        AuthenticationDTO authResult = dsConfig.getAuthentication();
+        assertNotNull(authResult);
+        assertTrue(authResult instanceof OAuth2);
+        assertEquals("test-client-id", ((OAuth2) authResult).getClientId());
+        // Verifying AuthenticationResponse part is more complex due to its instantiation inside the method
+        // For this test, verifying the type and one field is a good start.
+        assertNotNull(((OAuth2) authResult).getAuthenticationResponse());
+        assertEquals(
+                "sample-token",
+                ((OAuth2) authResult).getAuthenticationResponse().getToken());
+        assertEquals(
+                "sample-refresh-token",
+                ((OAuth2) authResult).getAuthenticationResponse().getRefreshToken());
+        assertEquals("test-client-secret", ((OAuth2) authResult).getClientSecret());
+    }
+
+    @Test
+    void updateAuthenticationDTO_WhenDsConfigIsNull_ShouldDoNothingAndNotThrow() {
+        DatasourceStorage storage = new DatasourceStorage();
+        storage.setDatasourceConfiguration(null); // dsConfig is null
+
+        DecryptedSensitiveFields decryptedFields = new DecryptedSensitiveFields();
+        decryptedFields.setAuthType(BearerTokenAuth.class.getName());
+
+        // Expect no exception
+        callUpdateAuthenticationDTOWithReflection(storage, decryptedFields);
+        assertNull(storage.getDatasourceConfiguration(), "DatasourceConfiguration should remain null");
+    }
+
+    @Test
+    void updateAuthenticationDTO_WhenAuthTypeIsNull_ShouldDoNothingAndNotSetAuth() {
+        DatasourceStorage storage = new DatasourceStorage();
+        DatasourceConfiguration dsConfig = new DatasourceConfiguration();
+        storage.setDatasourceConfiguration(dsConfig);
+
+        DecryptedSensitiveFields decryptedFields = new DecryptedSensitiveFields();
+        decryptedFields.setAuthType(null); // authType is null
+
+        callUpdateAuthenticationDTOWithReflection(storage, decryptedFields);
+
+        assertNull(dsConfig.getAuthentication(), "Authentication should not be set if authType is null");
+    }
+
+    @Test
+    @DisplayName("GHSA-93mf-9h52-gfxp: getEntitiesPresentInWorkspace must enforce READ_DATASOURCES permission")
+    void should_enforceReadPermission_when_getEntitiesPresentInWorkspace_isCalled() {
+        // Given
+        String workspaceId = "workspace1";
+        Datasource ds = new Datasource();
+        ds.setId("ds1");
+        ds.setName("TestDS");
+        when(datasourcePermission.getReadPermission()).thenReturn(AclPermission.READ_DATASOURCES);
+        when(datasourceService.getAllByWorkspaceIdWithStorages(workspaceId, AclPermission.READ_DATASOURCES))
+                .thenReturn(Flux.just(ds));
+
+        // When
+        Flux<Datasource> result = importService.getEntitiesPresentInWorkspace(workspaceId);
+
+        // Then
+        StepVerifier.create(result).expectNextCount(1).verifyComplete();
+        verify(datasourceService).getAllByWorkspaceIdWithStorages(workspaceId, AclPermission.READ_DATASOURCES);
+        verify(datasourceService, never()).getAllByWorkspaceIdWithStorages(eq(workspaceId), isNull());
+    }
+
+    @Test
+    @DisplayName("GHSA-p37g-mfwx-3r9f: import must enumerate workspace datasources with READ_DATASOURCES, "
+            + "never with a null (unpermissioned) AclPermission")
+    void should_enforceReadPermission_when_importEntities_collectsWorkspaceDatasources() {
+        // Given: an import into a workspace, where the artifact JSON carries no new datasources
+        // (isolates the vulnerable collision-matching call from the rest of importDatasources).
+        String workspaceId = "workspace1";
+        Workspace workspace = new Workspace();
+        workspace.setId(workspaceId);
+
+        lenient().when(datasourcePermission.getReadPermission()).thenReturn(AclPermission.READ_DATASOURCES);
+        // Only the correctly-permissioned call is stubbed to return data; the vulnerable
+        // permission=null call is separately stubbed to empty so the test fails via the
+        // explicit verify() below (a clean assertion failure) rather than a Mockito strict-
+        // stubbing exception or NPE.
+        lenient()
+                .when(datasourceService.getAllByWorkspaceIdWithStorages(
+                        eq(workspaceId), eq(AclPermission.READ_DATASOURCES)))
+                .thenReturn(Flux.empty());
+        lenient()
+                .when(datasourceService.getAllByWorkspaceIdWithStorages(eq(workspaceId), isNull()))
+                .thenReturn(Flux.empty());
+        lenient()
+                .when(workspaceService.getDefaultEnvironmentId(eq(workspaceId), isNull()))
+                .thenReturn(Mono.just("env1"));
+
+        ImportingMetaDTO importingMetaDTO = org.mockito.Mockito.mock(ImportingMetaDTO.class);
+        MappedImportableResourcesDTO mappedImportableResourcesDTO = new MappedImportableResourcesDTO();
+        mappedImportableResourcesDTO.setPluginMap(new HashMap<>());
+        ArtifactExchangeJson artifactExchangeJson = org.mockito.Mockito.mock(ArtifactExchangeJson.class);
+        // No datasources in the imported JSON: importDatasources() short-circuits with Mono.empty()
+        // as soon as it observes this, so the test isolates the workspace-datasource-collection call.
+        lenient().when(artifactExchangeJson.getDatasourceList()).thenReturn(List.of());
+
+        Mono<Workspace> workspaceMono = Mono.just(workspace);
+
+        // When
+        Mono<Void> result = importService.importEntities(
+                importingMetaDTO, mappedImportableResourcesDTO, workspaceMono, Mono.empty(), artifactExchangeJson);
+
+        // Then: the vulnerable call must never pass permission=null.
+        StepVerifier.create(result).verifyComplete();
+        verify(datasourceService, never()).getAllByWorkspaceIdWithStorages(eq(workspaceId), isNull());
+        verify(datasourceService).getAllByWorkspaceIdWithStorages(eq(workspaceId), eq(AclPermission.READ_DATASOURCES));
+    }
+}

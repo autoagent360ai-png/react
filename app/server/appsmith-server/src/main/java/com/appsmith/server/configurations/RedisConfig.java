@@ -1,0 +1,339 @@
+package com.appsmith.server.configurations;
+
+import com.appsmith.server.domains.LoginSource;
+import com.appsmith.server.dtos.OAuth2AuthorizedClientDTO;
+import com.appsmith.server.dtos.UserSessionDTO;
+import com.appsmith.util.RestrictedHostFilter;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import io.lettuce.core.AbstractRedisClient;
+import io.lettuce.core.ClientOptions;
+import io.lettuce.core.RedisClient;
+import io.lettuce.core.TimeoutOptions;
+import io.lettuce.core.cluster.ClusterClientOptions;
+import io.lettuce.core.cluster.RedisClusterClient;
+import io.lettuce.core.metrics.MicrometerCommandLatencyRecorder;
+import io.lettuce.core.metrics.MicrometerOptions;
+import io.lettuce.core.resource.ClientResources;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.observation.ObservationRegistry;
+import jakarta.annotation.PostConstruct;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.data.redis.connection.ReactiveRedisConnectionFactory;
+import org.springframework.data.redis.connection.RedisClusterConfiguration;
+import org.springframework.data.redis.connection.RedisConfiguration;
+import org.springframework.data.redis.connection.RedisNode;
+import org.springframework.data.redis.connection.RedisPassword;
+import org.springframework.data.redis.connection.RedisStandaloneConfiguration;
+import org.springframework.data.redis.connection.lettuce.LettuceClientConfiguration;
+import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
+import org.springframework.data.redis.connection.lettuce.LettucePoolingClientConfiguration;
+import org.springframework.data.redis.connection.lettuce.observability.MicrometerTracingAdapter;
+import org.springframework.data.redis.core.ReactiveRedisOperations;
+import org.springframework.data.redis.core.ReactiveRedisTemplate;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.JdkSerializationRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext;
+import org.springframework.data.redis.serializer.RedisSerializer;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+import org.springframework.data.redis.util.ByteUtils;
+import org.springframework.security.core.context.SecurityContext;
+import org.springframework.security.core.context.SecurityContextImpl;
+import org.springframework.security.oauth2.client.OAuth2AuthorizedClient;
+import org.springframework.session.data.redis.config.annotation.web.server.EnableRedisWebSession;
+
+import java.net.InetAddress;
+import java.net.URI;
+import java.net.UnknownHostException;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+
+@Configuration
+@Slf4j
+// Setting the maxInactiveInterval to 30 days
+@EnableRedisWebSession(maxInactiveIntervalInSeconds = 2592000)
+public class RedisConfig {
+
+    @Value("${appsmith.redis.url:}")
+    private String redisURL;
+
+    @Value("${appsmith.redis.git.url:}")
+    private String redisGitURL;
+
+    /**
+     * Teach the SSRF host filter which Redis the app is actually configured against, using the
+     * Spring-resolved property rather than only the {@code APPSMITH_REDIS_URL} env var the filter
+     * reads at static init. This closes a fail-open gap: an operator who sets {@code appsmith.redis.url}
+     * via application.properties or a {@code -D} system property (no env var) would otherwise leave
+     * the internal-Redis denylist empty, letting a datasource reach an in-cluster Redis. Runs once
+     * at startup, before any datasource can be tested. See GHSA-qhfj-g87x-m39w.
+     */
+    @PostConstruct
+    public void registerInternalRedisHostsWithSsrfFilter() {
+        RestrictedHostFilter.registerInternalRedisHosts(redisURL, redisGitURL);
+    }
+
+    /**
+     * Defense-in-depth: teach the SSRF host filter to block datasources that target the Appsmith
+     * instance's own routable address. That address is typically an RFC 1918 / site-local IP (Docker
+     * bridge {@code 172.17.x}, k8s pod {@code 10.x}, etc.), which the filter otherwise intentionally
+     * allows so legitimate customer datasources on private networks keep working — leaving the
+     * instance reachable from its own datasource layer. Registering the instance's own hostname(s)
+     * lets the filter resolve and block just its own address(es), via either the container hostname
+     * or the raw own IP, without blocking the rest of the private network.
+     *
+     * <p>Coverage is best-effort: only the address(es) the registered own hostname(s) resolve to are
+     * blocked, not a full network-interface enumeration. A multi-homed container's secondary-interface
+     * IPs are out of scope by design (hostname-scope decision). The filter also seeds these at static
+     * init; re-registering here keeps the set aligned with the running container. Runs once at startup,
+     * before any datasource can be tested.
+     */
+    @PostConstruct
+    public void registerOwnHostWithSsrfFilter() {
+        try {
+            RestrictedHostFilter.registerOwnHost(InetAddress.getLocalHost().getHostName());
+        } catch (UnknownHostException e) {
+            log.debug("Could not resolve local hostname for SSRF own-host registration; relying on static seed.");
+        }
+        RestrictedHostFilter.registerOwnHost(System.getenv("HOSTNAME"));
+    }
+
+    @Bean
+    @Primary
+    public ReactiveRedisConnectionFactory reactiveRedisConnectionFactory(ClientResources clientResources) {
+        final URI redisUri = URI.create(redisURL);
+        final String scheme = redisUri.getScheme();
+
+        switch (scheme) {
+            case "redis" -> {
+                final RedisStandaloneConfiguration config =
+                        new RedisStandaloneConfiguration(redisUri.getHost(), redisUri.getPort());
+                fillAuthentication(redisUri, config);
+                final LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                        .clientResources(clientResources)
+                        .build();
+                return new LettuceConnectionFactory(config, clientConfig);
+            }
+
+            case "rediss" -> {
+                final RedisStandaloneConfiguration config =
+                        new RedisStandaloneConfiguration(redisUri.getHost(), redisUri.getPort());
+                fillAuthentication(redisUri, config);
+                final LettuceClientConfiguration clientConfig = LettucePoolingClientConfiguration.builder()
+                        .clientResources(clientResources)
+                        .useSsl()
+                        .build();
+                return new LettuceConnectionFactory(config, clientConfig);
+            }
+
+            case "redis-cluster" -> {
+                // For ElastiCache Redis with cluster mode enabled, with the configuration endpoint.
+                final RedisClusterConfiguration clusterConfig = new RedisClusterConfiguration();
+                fillAuthentication(redisUri, clusterConfig);
+                clusterConfig.addClusterNode(new RedisNode(redisUri.getHost(), redisUri.getPort()));
+                return new LettuceConnectionFactory(
+                        clusterConfig,
+                        LettucePoolingClientConfiguration.builder()
+                                .clientResources(clientResources)
+                                .build());
+            }
+
+            default -> throw new InvalidRedisURIException("Invalid redis scheme: " + scheme);
+        }
+    }
+
+    @Bean
+    public AbstractRedisClient redisClient(ClientResources clientResources) {
+        String redisurl = redisURL;
+        final URI redisUri = URI.create(redisURL);
+        String scheme = redisUri.getScheme();
+        boolean isCluster = false;
+        if ("redis-cluster".equalsIgnoreCase(scheme)) {
+            isCluster = true;
+            // java clients do not support redis-cluster scheme
+            if (redisurl.startsWith("redis-cluster://")) {
+                redisurl = "redis://" + redisurl.substring("redis-cluster://".length());
+            }
+        }
+
+        if (isCluster) {
+            RedisClusterClient redisClusterClient = RedisClusterClient.create(clientResources, redisurl);
+            redisClusterClient.setOptions(ClusterClientOptions.builder()
+                    .timeoutOptions(TimeoutOptions.builder()
+                            .timeoutCommands(true)
+                            .fixedTimeout(Duration.ofMillis(2000))
+                            .build())
+                    .build());
+            return redisClusterClient;
+        }
+
+        RedisClient redisClient = RedisClient.create(clientResources, redisurl);
+        redisClient.setOptions(ClientOptions.builder()
+                .timeoutOptions(TimeoutOptions.builder()
+                        .timeoutCommands(true)
+                        .fixedTimeout(Duration.ofMillis(2000))
+                        .build())
+                .build());
+
+        return redisClient;
+    }
+
+    private void fillAuthentication(URI redisUri, RedisConfiguration.WithAuthentication config) {
+        final String userInfo = redisUri.getUserInfo();
+        if (StringUtils.isNotEmpty(userInfo)) {
+            final String[] parts = userInfo.split(":", 2);
+            config.setUsername(parts[0]);
+            config.setPassword(RedisPassword.of(parts.length > 1 ? parts[1] : null));
+        }
+    }
+
+    @Bean
+    public RedisSerializer<Object> springSessionDefaultRedisSerializer() {
+        return new JSONSessionRedisSerializer();
+    }
+
+    @Bean
+    public ClientResources clientResources(ObservationRegistry observationRegistry, MeterRegistry meterRegistry) {
+        return ClientResources.builder()
+                .tracing(new MicrometerTracingAdapter(observationRegistry, "appsmith-redis"))
+                .commandLatencyRecorder(new MicrometerCommandLatencyRecorder(meterRegistry, MicrometerOptions.create()))
+                .build();
+    }
+
+    @Primary
+    @Bean
+    ReactiveRedisOperations<String, String> reactiveRedisOperations(ReactiveRedisConnectionFactory factory) {
+        Jackson2JsonRedisSerializer<String> serializer = new Jackson2JsonRedisSerializer<>(String.class);
+
+        RedisSerializationContext.RedisSerializationContextBuilder<String, String> builder =
+                RedisSerializationContext.newSerializationContext(new StringRedisSerializer());
+
+        RedisSerializationContext<String, String> context =
+                builder.value(serializer).build();
+
+        return new ReactiveRedisTemplate<>(factory, context);
+    }
+
+    // Lifted from below and turned it into a bean. Wish Spring provided it as a bean.
+    // RedisWebSessionConfiguration.createReactiveRedisTemplate
+    @Bean
+    ReactiveRedisTemplate<String, Object> reactiveRedisTemplate(
+            ReactiveRedisConnectionFactory factory, RedisSerializer<Object> serializer) {
+        RedisSerializer<String> keySerializer = new StringRedisSerializer();
+        RedisSerializationContext<String, Object> serializationContext =
+                RedisSerializationContext.<String, Object>newSerializationContext(serializer)
+                        .key(keySerializer)
+                        .hashKey(keySerializer)
+                        .build();
+        return new ReactiveRedisTemplate<>(factory, serializationContext);
+    }
+
+    private static class JSONSessionRedisSerializer implements RedisSerializer<Object> {
+
+        private static final byte[] SESSION_DATA_PREFIX = "appsmith-session:".getBytes();
+
+        private static final byte[] OAUTH_CLIENT_PREFIX = "appsmith-oauth-client:".getBytes();
+
+        private final JdkSerializationRedisSerializer fallback = new JdkSerializationRedisSerializer();
+
+        private final GenericJackson2JsonRedisSerializer jsonSerializer =
+                new GenericJackson2JsonRedisSerializer(new JsonMapper());
+
+        @Override
+        public byte[] serialize(Object t) {
+            if (t instanceof SecurityContext) {
+                final UserSessionDTO session = UserSessionDTO.fromToken(((SecurityContext) t).getAuthentication());
+                final byte[] bytes = jsonSerializer.serialize(session);
+                return bytes == null ? null : ByteUtils.concat(SESSION_DATA_PREFIX, bytes);
+
+            } else if ((t instanceof Map)) {
+                final Map<?, ?> data = (Map<?, ?>) t;
+                boolean allValuesAreClientDTOs = true;
+                for (final LoginSource loginSource : LoginSource.oauthSources) {
+                    final Object value = data.get(loginSource.name().toLowerCase());
+                    if (value != null && !(value instanceof OAuth2AuthorizedClient)) {
+                        allValuesAreClientDTOs = false;
+                        break;
+                    }
+                }
+                if (allValuesAreClientDTOs) {
+                    final byte[] bytes = serializeOAuthClientMap(data);
+                    return bytes == null ? null : ByteUtils.concat(OAUTH_CLIENT_PREFIX, bytes);
+                }
+            }
+
+            return fallback.serialize(t);
+        }
+
+        private byte[] serializeOAuthClientMap(Map<?, ?> data) {
+            final Map<String, Object> dataMap = new HashMap<>();
+            for (final Map.Entry<?, ?> entry : data.entrySet()) {
+                if (entry.getValue() instanceof OAuth2AuthorizedClient) {
+                    final String key = (String) entry.getKey();
+                    final OAuth2AuthorizedClient client = (OAuth2AuthorizedClient) entry.getValue();
+                    final OAuth2AuthorizedClientDTO dto;
+                    try {
+                        dto = OAuth2AuthorizedClientDTO.fromOAuth2AuthorizedClient(client);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        throw e;
+                    }
+                    dataMap.put(key, dto);
+                } else {
+                    log.warn(
+                            "Unknown data type found in session data. Key: {}, Value: {}",
+                            entry.getKey(),
+                            entry.getValue());
+                }
+            }
+            return jsonSerializer.serialize(dataMap);
+        }
+
+        @Override
+        public Object deserialize(byte[] bytes) {
+            if (ByteUtils.startsWith(bytes, SESSION_DATA_PREFIX)) {
+                final byte[] data = Arrays.copyOfRange(bytes, SESSION_DATA_PREFIX.length, bytes.length);
+                final UserSessionDTO session = jsonSerializer.deserialize(data, UserSessionDTO.class);
+
+                if (session == null) {
+                    throw new IllegalArgumentException("Could not deserialize user session, got null");
+                }
+
+                return new SecurityContextImpl(session.makeToken());
+
+            } else if (ByteUtils.startsWith(bytes, OAUTH_CLIENT_PREFIX)) {
+                final byte[] data = Arrays.copyOfRange(bytes, OAUTH_CLIENT_PREFIX.length, bytes.length);
+
+                final HashMap<String, Map<?, ?>> clientData = jsonSerializer.deserialize(data, HashMap.class);
+                if (clientData == null) {
+                    throw new IllegalArgumentException("Could not deserialize OAuth2 client, got null");
+                }
+
+                final Map<String, OAuth2AuthorizedClient> sessionData = new HashMap<>();
+                for (final Map.Entry<String, Map<?, ?>> entry : clientData.entrySet()) {
+                    final OAuth2AuthorizedClientDTO dto =
+                            new ObjectMapper().convertValue(entry.getValue(), OAuth2AuthorizedClientDTO.class);
+                    sessionData.put(entry.getKey(), dto.makeOAuth2AuthorizedClient());
+                }
+
+                return sessionData;
+            }
+
+            return fallback.deserialize(bytes);
+        }
+    }
+
+    private static class InvalidRedisURIException extends RuntimeException {
+        public InvalidRedisURIException(String message) {
+            super(message);
+        }
+    }
+}

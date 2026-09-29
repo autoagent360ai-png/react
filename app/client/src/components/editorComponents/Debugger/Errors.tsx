@@ -1,0 +1,20 @@
+import React, { useEffect } from "react";
+import { useSelector } from "react-redux";
+import { getFilteredErrors } from "selectors/debuggerSelectors";
+import { getCurrentUser } from "selectors/usersSelectors";
+import bootPylon from "utils/bootPylon";
+import ErrorLog from "./ErrorLogs/ErrorLog";
+
+// This component is used to fetch the errors from the store and pass it to the error log component.
+function Errors(props: { hasShortCut?: boolean }) {
+  const errors = useSelector(getFilteredErrors);
+  const currentUser = useSelector(getCurrentUser);
+
+  useEffect(() => {
+    bootPylon(currentUser);
+  }, [currentUser?.email]);
+
+  return <ErrorLog errors={errors} hasShortCut={props.hasShortCut} />;
+}
+
+export default Errors;
