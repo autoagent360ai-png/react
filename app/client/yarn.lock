@@ -11638,12 +11638,12 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@types/node-forge@npm:^0.10.0":
-  version: 0.10.0
-  resolution: "@types/node-forge@npm:0.10.0"
+"@types/node-forge@npm:^1.3.14":
+  version: 1.3.14
+  resolution: "@types/node-forge@npm:1.3.14"
   dependencies:
     "@types/node": "*"
-  checksum: 2ae1c6147b80655e8d85c5e532e0e35d025e81cb1a5b44a87df62a8fb1a64d96cf88f56f17c53277b7a793733b501c7f17ac09c023e4e3eaa77f727f0b3de399
+  checksum: ff621803390e723e56b289a89fca3a06f9f8b438add1b843203a0f64bcbc7ac03d457136b3c15010b5bc89d81f57b35f62964e6e980f6290597bb21b4463c009
   languageName: node
   linkType: hard
 
@@ -13857,7 +13857,7 @@ __metadata:
     "@types/moment-timezone": ^0.5.10
     "@types/node": ^10.12.18
     "@types/node-fetch": ^2.6.11
-    "@types/node-forge": ^0.10.0
+    "@types/node-forge": ^1.3.14
     "@types/object-hash": ^2.2.1
     "@types/pluralize": ^0.0.33
     "@types/prismjs": ^1.16.1
